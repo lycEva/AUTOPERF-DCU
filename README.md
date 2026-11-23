@@ -1,4 +1,6 @@
-# DCU 自动化压测与容器资源监控
+# AUTOPERF-DCU
+
+DCU 自动化压测与容器资源监控
 
 [run_test.sh](run_test.sh) 一条命令完成：**改服务配置（可选）→ 预热 → JMeter 压测 → 直接采集容器资源 → 输出 PNG 曲线**。不依赖 ServerAgent，每次运行独立目录，原始 JMX 与共享配置永不被改写。
 
