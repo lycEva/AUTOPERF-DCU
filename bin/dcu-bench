@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+# dcu-bench —— DCU 自动化压测与资源监控 CLI。
+#
+# 设计要点：
+#   * 自身路径用 readlink -f 解析，安装成软链后从任意目录调用都能找回工具目录；
+#   * 全程不改工作目录（不 cd），因此所有相对路径（JMX、结果目录、配置文件）
+#     都按“你敲命令时所在的目录”解析；
+#   * 只负责解析与分发，真实工作交给 run_test.sh / update_server_config.sh /
+#     summary_monitor/*.py，并用 exec 替换自身进程：退出码、SIGINT/SIGTERM
+#     都能直达真正干活的进程，不会在中间层被吞掉。
+#
+# 安装：bash install.sh（默认软链到 /usr/local/bin/dcu-bench）
+set -euo pipefail
+
+DCU_BENCH_VERSION=1.0.0
+
+# --- 定位工具目录（兼容软链、相对路径调用） ---------------------------------
+resolve_self() {
+  local src=${BASH_SOURCE[0]} target hops=0 link
+  # readlink -f 在 Linux 上就能一次解决软链链，缺失时退回逐跳解析。
+  if target=$(readlink -f -- "$src" 2>/dev/null) && [ -n "$target" ]; then
+    printf '%s\n' "$target"
+    return 0
+  fi
+  target=$src
+  while [ -L "$target" ]; do
+    hops=$((hops + 1))
+    if [ "$hops" -gt 40 ]; then
+      echo "❌ 解析 dcu-bench 自身的软链层数过多: $src" >&2
+      return 1
+    fi
+    link=$(readlink -- "$target")
+    case $link in
+      /*) target=$link ;;
+      *) target=$(dirname -- "$target")/$link ;;
+    esac
+  done
+  printf '%s\n' "$target"
+}
+
+SELF=$(resolve_self) || exit 1
+SELF_DIR=$(cd -- "$(dirname -- "$SELF")" && pwd)
+# bin/dcu-bench 在 bin/ 下；也兼容直接放在项目根目录的部署方式。
+if [ -f "$SELF_DIR/run_test.sh" ]; then
+  TOOL_DIR=$SELF_DIR
+elif [ -f "$SELF_DIR/../run_test.sh" ]; then
+  TOOL_DIR=$(cd -- "$SELF_DIR/.." && pwd)
+else
+  echo "❌ 找不到 run_test.sh（dcu-bench 应位于项目根目录或其 bin/ 子目录）: $SELF_DIR" >&2
+  exit 1
+fi
+
+# 与 run_test.sh 保持同一口径：固定系统 Python，避开 conda 的 libffi 冲突。
+PYTHON_BIN=${PYTHON_BIN:-/usr/bin/python3}
+
+usage() {
+  cat <<'EOF'
+dcu-bench —— DCU 自动化压测与容器资源监控
+
+用法:
+  dcu-bench <jmx> <结果目录> <容器名> <线程数> <正式秒数> [选项]   # 等价于 dcu-bench run ...
+  dcu-bench <子命令> [参数...]
+
+子命令:
+  run       完整流程：改服务配置（可选）→ 预热（可选）→ JMeter 压测
+            → 直接采集容器资源 → 输出 PNG 曲线。参数与 run_test.sh 完全一致。
+  config    只改服务 server_config.json 并推进容器重启（= update_server_config.sh）
+  collect   只做资源采集（= summary_monitor/collect_metrics.py）
+  plot      用已有 metrics.csv 重绘曲线（= summary_monitor/plot_metrics.py）
+  ports     列出 ports.json 里的服务名与端口
+  doctor    体检运行环境（Python/Docker/rocm-smi/JMeter/ports.json）
+  version   打印版本
+  help      显示本帮助
+
+run 的位置参数:
+  <jmx>        JMeter 模板（.jmx），相对路径按当前目录解析
+  <结果目录>   每次运行在其下新建 run_<容器>_<时间>_<随机>/，相对路径按当前目录解析
+  <容器名>     被压测的容器
+  <线程数>     并发线程数（正整数）
+  <正式秒数>   正式测量时长（正整数），不含预热
+
+run 的常用选项:
+  --service <名>            必传，查 ports.json 得到 JMX 端口
+  --port <N>                直接指定端口（优先级最高）
+  --ports-config <路径>     换一份端口配置（默认 <工具目录>/ports.json）
+  --warmup <N>              预热秒数，预热期不统计、不采样
+  --monitor-containers a,b  一起采集的容器（默认只采压测容器）
+  --monitor-interval <秒>   采样起点间隔，默认 0.3
+  --monitor-timeout <秒>    每轮采集超时预算，默认 2
+  --monitor-policy tolerant|strict        默认 tolerant
+  --monitor-max-consecutive-failures <N>  默认 5
+  --monitor-max-failure-percent <0-100>   默认 1
+  --server-config <路径>    压测前改 workers/threads 并重启容器（改运行目录副本）
+  --workers <N>             配合 --server-config，必须同时给
+  --server-threads <N>      配合 --server-config，必须同时给
+  --target-path <容器内绝对路径>  默认 /hexapp/ai-<服务>-serving/conf/server_config.json
+  --config-wait <秒>        重启后等就绪，默认 90；0 跳过探测
+
+环境变量:
+  PYTHON_BIN    Python 解释器，默认 /usr/bin/python3
+  JMETER        jmeter 可执行文件，默认从 PATH 查找
+  MONITOR_INTERVAL / MONITOR_TIMEOUT / MONITOR_POLICY /
+  MONITOR_MAX_CONSECUTIVE_FAILURES / MONITOR_MAX_FAILURE_PERCENT / WARMUP
+                同名选项的默认值，命令行优先
+
+示例:
+  # 最小用法（任何目录下都可以）
+  dcu-bench ./fs/frdetect/yc.jmx ./results container_a 3 900 --service fs
+
+  # 改配置 + 预热 120s + 正式 600s + 出图
+  dcu-bench ./fs/frdetect/yc.jmx ./results container_a 3 600 --service fs \
+    --server-config ./server_config.json --workers 2 --server-threads 8 --warmup 120
+
+  # A 调用 B：两个容器画进同一批图
+  dcu-bench ./fs/frdetect/yc.jmx ./results svc-a 10 900 --service fs \
+    --monitor-containers svc-a,svc-b
+
+  dcu-bench ports
+  dcu-bench doctor
+  dcu-bench plot ./results/run_xxx/metrics.csv --output-dir ./results/run_xxx/plots
+EOF
+}
+
+die_usage() {
+  echo "❌ $*" >&2
+  echo "   运行 'dcu-bench help' 查看用法" >&2
+  exit 2
+}
+
+cmd_run() {
+  if [ "$#" -eq 0 ]; then
+    die_usage "run 缺少参数"
+  fi
+  case $1 in
+    -h | --help) usage; exit 0 ;;
+  esac
+  # exec：保留调用方 PID，Ctrl-C / kill 直达 run_test.sh 及其子进程。
+  exec bash "$TOOL_DIR/run_test.sh" "$@"
+}
+
+cmd_config() {
+  exec bash "$TOOL_DIR/update_server_config.sh" "$@"
+}
+
+require_python() {
+  if [ ! -x "$PYTHON_BIN" ]; then
+    echo "❌ 找不到可执行的 Python: $PYTHON_BIN（可用 PYTHON_BIN 环境变量指定）" >&2
+    exit 1
+  fi
+}
+
+cmd_collect() {
+  require_python
+  exec "$PYTHON_BIN" "$TOOL_DIR/summary_monitor/collect_metrics.py" "$@"
+}
+
+cmd_plot() {
+  require_python
+  exec "$PYTHON_BIN" "$TOOL_DIR/summary_monitor/plot_metrics.py" "$@"
+}
+
+cmd_ports() {
+  local ports_config=$TOOL_DIR/ports.json as_json=0
+  while [ "$#" -gt 0 ]; do
+    case $1 in
+      --ports-config)
+        [ "$#" -ge 2 ] || die_usage "--ports-config 缺少参数"
+        ports_config=$2
+        shift 2
+        ;;
+      --json) as_json=1; shift ;;
+      -h | --help) usage; exit 0 ;;
+      *) die_usage "ports 未知参数: $1" ;;
+    esac
+  done
+  require_python
+  "$PYTHON_BIN" - "$ports_config" "$as_json" <<'PY'
+import json
+import sys
+
+path, as_json = sys.argv[1], sys.argv[2] == "1"
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+except FileNotFoundError:
+    sys.exit(f"❌ 端口配置不存在: {path}")
+except (OSError, ValueError) as exc:
+    sys.exit(f"❌ 端口配置无法解析: {path}（{exc}）")
+if isinstance(data, dict) and isinstance(data.get("services"), dict):
+    data = data["services"]
+if not isinstance(data, dict):
+    sys.exit(f"❌ 端口配置格式错误，应为 {{服务名: 端口}}: {path}")
+items = {str(k): v for k, v in data.items()
+         if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 65535}
+if as_json:
+    print(json.dumps(items, ensure_ascii=False, indent=2, sort_keys=True))
+else:
+    if not items:
+        sys.exit(f"❌ 端口配置里没有有效的服务端口: {path}")
+    width = max(len(name) for name in items)
+    print(f"服务名{' ' * (width - 3)}  端口")
+    print(f"{'-' * width}  -----")
+    for name in sorted(items):
+        print(f"{name}{' ' * (width - len(name))}  {items[name]}")
+PY
+}
+
+cmd_doctor() {
+  local rc=0
+  echo "dcu-bench ${DCU_BENCH_VERSION}｜工具目录: $TOOL_DIR"
+  echo "当前目录: $PWD"
+  echo
+
+  if [ -x "$PYTHON_BIN" ]; then
+    printf '  ✅ Python  %s (%s)\n' "$PYTHON_BIN" "$("$PYTHON_BIN" -c 'import platform; print(platform.python_version())' 2>/dev/null || echo '版本未知')"
+  else
+    printf '  ❌ Python  %s 不可执行（压测与绘图都依赖它）\n' "$PYTHON_BIN"
+    rc=1
+  fi
+
+  local jmeter_bin=${JMETER:-jmeter}
+  if command -v "$jmeter_bin" >/dev/null 2>&1; then
+    printf '  ✅ JMeter  %s (%s)\n' "$jmeter_bin" "$(command -v "$jmeter_bin")"
+  else
+    printf '  ❌ JMeter  找不到 %s（可用 JMETER 环境变量指定）\n' "$jmeter_bin"
+    rc=1
+  fi
+
+  if ! command -v docker >/dev/null 2>&1; then
+    printf '  ❌ Docker  未安装\n'
+    rc=1
+  elif timeout 5 docker info >/dev/null 2>&1; then
+    printf '  ✅ Docker  %s｜守护进程可用\n' "$(command -v docker)"
+  else
+    printf '  ❌ Docker  已安装但守护进程不可用（docker info 失败）\n'
+    rc=1
+  fi
+
+  local rocm=${ROCM_SMI:-rocm-smi}
+  if command -v "$rocm" >/dev/null 2>&1; then
+    printf '  ✅ rocm-smi  %s\n' "$(command -v "$rocm")"
+    if timeout 15 "$rocm" --showproductname >/dev/null 2>&1; then
+      printf '  ✅ DCU       rocm-smi 可正常查询显卡\n'
+    else
+      printf '  ⚠️  DCU       rocm-smi 存在但查询失败：显存指标可能记为空值\n'
+    fi
+  else
+    printf '  ⚠️  rocm-smi  未找到：显存指标会缺失，CPU/内存仍可采集\n'
+  fi
+
+  if [ -f "$TOOL_DIR/ports.json" ]; then
+    if "$PYTHON_BIN" -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); sys.exit(0 if isinstance(d,dict) and d else 1)' "$TOOL_DIR/ports.json" 2>/dev/null; then
+      printf '  ✅ 端口配置  %s\n' "$TOOL_DIR/ports.json"
+    else
+      printf '  ❌ 端口配置  %s 无法解析\n' "$TOOL_DIR/ports.json"
+      rc=1
+    fi
+  else
+    printf '  ❌ 端口配置  缺少 %s\n' "$TOOL_DIR/ports.json"
+    rc=1
+  fi
+
+  local script
+  for script in run_test.sh prepare_run.py summary_monitor/run_direct.py summary_monitor/plot_metrics.py; do
+    [ -f "$TOOL_DIR/$script" ] || { printf '  ❌ 缺少工具文件  %s\n' "$script"; rc=1; }
+  done
+
+  echo
+  if [ "$rc" -eq 0 ]; then
+    echo "结论: 环境可用，可以开始压测。"
+  else
+    echo "结论: 存在阻塞项（❌），修好后重试。" >&2
+  fi
+  return "$rc"
+}
+
+# --- 分发 -------------------------------------------------------------------
+if [ "$#" -eq 0 ]; then
+  usage
+  exit 0
+fi
+
+case $1 in
+  run) shift; cmd_run "$@" ;;
+  config | update-config) shift; cmd_config "$@" ;;
+  collect) shift; cmd_collect "$@" ;;
+  plot) shift; cmd_plot "$@" ;;
+  ports) shift; cmd_ports "$@" ;;
+  doctor | check) shift; cmd_doctor ;;
+  version | --version | -V) echo "dcu-bench ${DCU_BENCH_VERSION}"; exit 0 ;;
+  help | --help | -h) usage; exit 0 ;;
+  -*)
+    die_usage "未知选项或缺少子命令: $1"
+    ;;
+  *)
+    # 兼容老用法：第一个参数不是子命令时，整体当作 run 的位置参数。
+    cmd_run "$@"
+    ;;
+esac

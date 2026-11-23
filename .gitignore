@@ -1,0 +1,19 @@
+# Local workspace and upload preparation
+.dsh-project/
+.staging/
+.upload-repository/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# Generated benchmark output
+results/
