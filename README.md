@@ -2,14 +2,14 @@
 
 DCU 自动化压测与容器资源监控
 
-[run_test.sh](run_test.sh) 一条命令完成：**改服务配置（可选）→ 预热 → JMeter 压测 → 直接采集容器资源 → 输出 PNG 曲线**。不依赖 ServerAgent，每次运行独立目录，原始 JMX 与共享配置永不被改写。
+[run_test.sh](run_test.sh) 一条命令完成：**改服务配置（可选）→ 预热 → JMeter 压测 → 直接采集容器资源 → 输出 PNG 曲线**。每次运行独立目录，原始 JMX 与共享配置永不被改写。
 
 环境：Linux、Docker、`rocm-smi`、JMeter、系统 Python `/usr/bin/python3`。
-无需 matplotlib/Pillow（PNG 由系统 librsvg/Cairo 渲染），无需监听 7777。
+无需 matplotlib/Pillow（PNG 由系统 librsvg/Cairo 渲染）。
 
 装成命令后可在**任意目录**调用，见 [命令行工具 dcu-bench](#命令行工具-dcu-bench任意目录执行)。
 
-> **Python 必须用 `/usr/bin/python3`。** 本机 conda 的 `libffi.so.7` 指向 libffi 8.x，缺 `LIBFFI_BASE_7.0` 符号，加载系统 `libgobject` 会失败，导致绘图失败、整轮退出码 2。`run_test.sh` 已固定 `PYTHON_BIN=/usr/bin/python3`；`plot_metrics.py`/`collect_metrics.py` 入口遇到加载失败会自动用系统 Python 重新执行自己。
+> **Python 必须用 `/usr/bin/python3`。** 本机 conda 的 `libffi.so.7` 指向 libffi 8.x，缺 `LIBFFI_BASE_7.0` 符号，加载系统 `libgobject` 会失败，导致绘图失败、整轮退出码 2。`run_test.sh`（以及封装它的 `dcu-bench`）已固定 `PYTHON_BIN=/usr/bin/python3`；`plot_metrics.py`/`collect_metrics.py` 入口遇到加载失败会自动用系统 Python 重新执行自己。
 
 ## 命令行工具 dcu-bench（任意目录执行）
 
@@ -57,14 +57,19 @@ dcu-bench /root/lyc/yc/DCU-TOOL/fs/frdetect/yc.jmx ./results container_a 3 900 -
 
 ## 快速开始
 
+装一次就能在任意目录用 `dcu-bench`（没装时把 `dcu-bench` 换成 `bash run_test.sh`，参数完全一致）：
+
 ```bash
-bash run_test.sh <jmx路径> <结果目录> <容器名> <线程数> <正式秒数> --service <服务名> [选项]
+# 装一次：软链到 /usr/local/bin（非 root 加 --prefix ~/.local/bin）
+bash install.sh
+
+dcu-bench <jmx路径> <结果目录> <容器名> <线程数> <正式秒数> --service <服务名> [选项]
 
 # 最小用法
-bash run_test.sh ./fs/frdetect/yc.jmx ./results container_a 3 900 --service fs
+dcu-bench ./fs/frdetect/yc.jmx ./results container_a 3 900 --service fs
 
 # 改配置 + 预热120秒 + 正式600秒 + 出图
-bash run_test.sh ./fs/frdetect/yc.jmx ./results container_a 3 600 --service fs \
+dcu-bench ./fs/frdetect/yc.jmx ./results container_a 3 600 --service fs \
   --server-config ./server_config.json --workers 2 --server-threads 8 --warmup 120
 ```
 
@@ -109,18 +114,38 @@ bash run_test.sh ./fs/frdetect/yc.jmx ./results container_a 3 600 --service fs \
 | 预热 N 秒 | 持续施压 | 不记录 | 不采样 |
 | 正式 M 秒 | 同一轮 JMeter | 只纳入窗口内发起的请求 | 记录 CSV、曲线与峰值 |
 
+### 预热参数
+
+| 写法 | 默认 | 说明 |
+| --- | --- | --- |
+| `--warmup <秒>` | `0` | 预热秒数，非负整数（`0` 或 `[1-9][0-9]*`，前导零会被拒绝） |
+| 第五个位置参数 | 必传 | 始终是**正式测量**时长，不含预热 |
+| `WARMUP=<秒>` | `0` | 环境变量形式，作用同 `--warmup`，命令行优先 |
+
+```bash
+# 预热 120 秒 + 正式测量 600 秒：总施压 720 秒，JTL/报告只算后 600 秒
+dcu-bench ./fs/frdetect/yc.jmx ./results container_a 3 600 --service fs --warmup 120
+```
+
+- `--warmup 0`（默认）不预热：不改写 JMX 结构、不注入任何脚本，任意多个 ThreadGroup 都能跑。
+- `--warmup >0` 才做窗口手术：ThreadGroup 改成持续循环、调度时长 = 预热 + 正式，每个采样器挂一个按**请求开始时间**过滤的后置处理器，所以跨过边界的慢请求算预热、不算正式。
+- 窗口文件 `measurement_window.json` 在 JMeter 首次采样时写入（`load_started_epoch_s`、`measurement_start_epoch_s`、`measurement_end_epoch_s`、`warmup_s`、`duration_s`），监控等到它出现才开始落 CSV。
+- 配合 `--server-config` 时，改配置、重启、等就绪都在预热之前完成，预热从 JMeter 首次采样算起。
+
 预热对 JMX 结构有要求（不满足会在施压前明确报错，不会静默跑错）：恰好一个启用的普通 ThreadGroup + 启用采样器；不支持事务、Include、Module、自定义控制器、setup/teardown/插件线程组、串行计划。相对路径（CSVDataSet/Include）会按模板目录转成绝对路径。
 
 ## 多容器
 
 ```bash
 # 场景1：两个无关服务同时压测 —— 各跑一次，各自结果目录
-bash run_test.sh ./fs/frdetect/yc.jmx ./results container_a 3 900 --service fs &
-bash run_test.sh ./fs/frocr/yc.jmx ./results container_b 5 900 --service fs &
+dcu-bench ./fs/frdetect/yc.jmx ./results container_a 3 900 --service fs &
+dcu-bench ./fs/frocr/yc.jmx ./results container_b 5 900 --service fs &
 
 # 场景2：A 调用 B —— 压测 A，A/B 画进同一批图
-bash run_test.sh ./fs/frdetect/yc.jmx ./results svc-a 10 900 --service fs --monitor-containers svc-a,svc-b
+dcu-bench ./fs/frdetect/yc.jmx ./results svc-a 10 900 --service fs --monitor-containers svc-a,svc-b
 ```
+
+未安装 CLI 时，把上面每条 `dcu-bench` 换成 `bash run_test.sh`，位置参数与选项一字不差。
 
 第三个位置参数是压测目标容器；`--monitor-containers` 只决定采谁。每轮 = 每容器一条 `docker top` + 一条共享的 `rocm-smi`，同一时刻取数。
 
@@ -146,7 +171,7 @@ bash run_test.sh ./fs/frdetect/yc.jmx ./results svc-a 10 900 --service fs --moni
 
 ```text
 results/run_<容器名>_<时间>_<随机串>/
-├── plan.jmx                 # 独立运行副本（端口已改、PerfMon 已禁用）
+├── plan.jmx                 # 独立运行副本（端口已改）
 ├── result.jtl / jmeter.log / report/index.html
 ├── metrics.csv              # 四指标 + 状态 + 采样耗时
 ├── ready.json               # 监控预检
@@ -167,11 +192,11 @@ results/run_<容器名>_<时间>_<随机串>/
 ```bash
 bash update_server_config.sh ./server_config.json <容器名> <服务名> 4 8 \
   [--target-path /容器内/绝对路径/server_config.json]
+
+# 或走 CLI，参数相同
+dcu-bench config ./server_config.json <容器名> <服务名> 4 8 \
+  [--target-path /容器内/绝对路径/server_config.json]
 ```
-
-## PerfMon 已移除
-
-只保留 direct 直接采集。模板里残留的 `kg.apc.jmeter.perfmon.PerfMonCollector` 会被禁用（`enabled=false`），不再生成 `run_scripts/`、`cpu_state/`、`perfmon.jtl`，也不需要 ServerAgent(7777)。
 
 ## 单独采集或重绘
 
@@ -187,7 +212,7 @@ dcu-bench collect --container a --container b --output-dir ./standalone --durati
 dcu-bench plot ./standalone/metrics.csv --output-dir ./standalone/plots
 ```
 
-历史失败轮次无法补画真实曲线；绘图器不会把旧 PerfMon 的 `-1000` 当有效值。
+历史失败轮次无法补画真实曲线。
 
 ## 回归测试
 
