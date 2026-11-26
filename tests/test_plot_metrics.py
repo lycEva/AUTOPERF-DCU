@@ -165,7 +165,7 @@ class PlotMetricsTests(unittest.TestCase):
                 ".//s:text[@x='{}']".format(plot_metrics.LEFT - 9), NS)]
         self.assertEqual(y_ticks(self.xml('memory')), ['0', '1.9', '3.8', '5.7', '7.6'])
         # The peak readout uses the same two significant digits as the axis.
-        self.assertIn("Peak: 7.6 GiB", self.texts('memory'))
+        self.assertIn("Peak: 7.611 GiB", self.texts('memory'))
         # Two significant digits must not become 1.5e+02 on the percentage axis.
         self.assertEqual(y_ticks(self.xml('cpu')), ['0%', '50%', '100%', '150%', '200%'])
         self.assertEqual(y_ticks(self.xml('vram')), ['0', '25', '50', '75', '100'])
@@ -240,7 +240,7 @@ class PlotMetricsTests(unittest.TestCase):
         self.assertEqual(metric["valid_samples"], 144001)
         self.assertEqual(metric["max"], 999)
         self.assertEqual(metric["peak_timestamp"], f"sample-{peak_index}")
-        self.assertIn(f"Peak: 1000 % at sample-{peak_index}", self.texts())
+        self.assertIn(f"Peak: 999 % at sample-{peak_index}", self.texts())
         points = self.xml().find(".//s:polyline", NS).attrib["points"].split()
         self.assertLessEqual(len(points), 4 * (plot_metrics.WIDTH - plot_metrics.LEFT - plot_metrics.RIGHT))
         self.assertIn(85.0, [float(p.split(",")[1]) for p in points])
@@ -275,7 +275,7 @@ class PlotMetricsTests(unittest.TestCase):
         self.assertEqual(marker.find("s:text", NS).text, "Peak")
         tooltip = marker.find("s:title", NS).text
         self.assertIn(timestamp, tooltip)
-        self.assertIn("Peak CPU: 10 %", tooltip)
+        self.assertIn("Peak CPU: 10.12 %", tooltip)
         self.assertIn("elapsed_s: 30.0", tooltip)
         self.assertIn("container: demo", tooltip)
         overview_markers = self.xml("overview").findall(".//s:g[@class='peak-marker']", NS)

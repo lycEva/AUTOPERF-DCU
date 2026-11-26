@@ -133,6 +133,20 @@ def _time_ticks(low_minutes, high_minutes, target=6):
     return ticks
 
 
+def _peak_value(value, digits=4):
+    """Peak readout: `digits` significant digits, never below whole units.
+
+    Axis ticks round to two digits for a clean grid, but the peak readout keeps
+    the real magnitude: 24656.7 MiB reads 24657 MiB (unit digit kept) while
+    7.61076 GiB reads 7.611 GiB (four significant digits).
+    """
+    if not math.isfinite(value):
+        return "0"
+    if 1000.0 <= abs(value) < 1e12:
+        return f"{round(value):.0f}"
+    return _axis_value(value, digits)
+
+
 def _reduce(points, xmin, xmax, pixels):
     """Reduce (elapsed, value, segment, row_index) without crossing gaps.
 
@@ -207,7 +221,7 @@ def _panel(rows, metric, containers, yoffset=0):
                      f'{_escape(", ".join(containers) or "(none)")}</text>')
     if values:
         peak = max((row for row in rows if row[column] is not None), key=lambda row: row[column])
-        peak_text = (f'Peak: {_axis_value(peak[column])} {unit} at '
+        peak_text = (f'Peak: {_peak_value(peak[column])} {unit} at '
                      f'{peak["timestamp"] or "unknown time"} | container: {peak["container"]}')
     else:
         peak_text = "No valid samples (No valid data)"
@@ -265,7 +279,7 @@ def _panel(rows, metric, containers, yoffset=0):
         label_x = float(x) - 9 if float(x) > WIDTH - RIGHT - 65 else float(x) + 9
         anchor = "end" if float(x) > WIDTH - RIGHT - 65 else "start"
         label_y = float(y) + 18 if float(y) < TOP + plot_height - 25 else float(y) - 12
-        tooltip = (f'Peak {label}: {_axis_value(peak[column])} {unit} | timestamp: {peak["timestamp"] or "unknown time"}'
+        tooltip = (f'Peak {label}: {_peak_value(peak[column])} {unit} | timestamp: {peak["timestamp"] or "unknown time"}'
                    f' | elapsed_s: {peak["elapsed_s"]} | container: {peak["container"]}')
         parts.extend((f'<g class="peak-marker" aria-label="Peak {_escape(label)}">',
                       f'<title>{_escape(tooltip)}</title>',
