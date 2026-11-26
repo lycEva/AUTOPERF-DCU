@@ -133,6 +133,45 @@ class PlotMetricsTests(unittest.TestCase):
         self.assertEqual([all(text.endswith('%') for text in y_ticks(panel))
                           for panel in panels], [True, False, True, False])
 
+    def test_x_axis_ticks_and_label_are_minutes(self):
+        self.render_rows([self.row(0, 1), self.row(600, 2), self.row(1200, 3)])
+        tick_y = str(plot_metrics.TOP + (plot_metrics.HEIGHT - plot_metrics.TOP
+                                         - plot_metrics.BOTTOM) + 20)
+        x_ticks = [node.text for node in self.xml().findall(
+            ".//s:text[@y='{}']".format(tick_y), NS)]
+        self.assertEqual(x_ticks, ['0', '5', '10', '15', '20'])
+        self.assertIn("Elapsed time (min)", self.texts())
+        self.assertNotIn("Elapsed time (s)", self.texts())
+
+    def test_tiny_nonzero_origin_does_not_become_scientific_notation(self):
+        # The first sample lands 0.16 ms after the run start; the origin tick
+        # used to read 2.68e-06 min.
+        self.render_rows([self.row(0.0001608, 1), self.row(1000, 2), self.row(2069.7, 3)])
+        tick_y = str(plot_metrics.TOP + (plot_metrics.HEIGHT - plot_metrics.TOP
+                                         - plot_metrics.BOTTOM) + 20)
+        x_ticks = [node.text for node in self.xml().findall(
+            ".//s:text[@y='{}']".format(tick_y), NS)]
+        self.assertEqual(x_ticks[0], '0')
+        self.assertFalse([text for text in x_ticks if 'e' in text.lower()])
+        points = self.xml().find(".//s:polyline", NS).attrib["points"].split()
+        x = [float(p.split(",")[0]) for p in points]
+        self.assertAlmostEqual(x[0], plot_metrics.LEFT, places=1)
+
+    def test_y_ticks_use_two_significant_digits(self):
+        self.render_rows([self.row(0, 0, 100, 20, 1),
+                          self.row(60, 200, 100, 25, 7.61076)])
+        def y_ticks(root):
+            return [node.text for node in root.findall(
+                ".//s:text[@x='{}']".format(plot_metrics.LEFT - 9), NS)]
+        self.assertEqual(y_ticks(self.xml('memory')), ['0', '1.9', '3.8', '5.7', '7.6'])
+        # The peak readout uses the same two significant digits as the axis.
+        self.assertIn("Peak: 7.6 GiB", self.texts('memory'))
+        # Two significant digits must not become 1.5e+02 on the percentage axis.
+        self.assertEqual(y_ticks(self.xml('cpu')), ['0%', '50%', '100%', '150%', '200%'])
+        self.assertEqual(y_ticks(self.xml('vram')), ['0', '25', '50', '75', '100'])
+        for name in ('cpu', 'vram', 'vram_utilization', 'memory'):
+            self.assertFalse([t for t in y_ticks(self.xml(name)) if 'e' in t.lower()])
+
     def test_partial_samples_and_missing_breaks(self):
         summary = self.render_rows([self.row(0, 1), self.row(1, 2), self.row(2, "", 99),
                                     self.row(3, 4), self.row(4, 5, status="error", error="partial")])
@@ -201,7 +240,7 @@ class PlotMetricsTests(unittest.TestCase):
         self.assertEqual(metric["valid_samples"], 144001)
         self.assertEqual(metric["max"], 999)
         self.assertEqual(metric["peak_timestamp"], f"sample-{peak_index}")
-        self.assertIn(f"Peak: 999 % at sample-{peak_index}", self.texts())
+        self.assertIn(f"Peak: 1000 % at sample-{peak_index}", self.texts())
         points = self.xml().find(".//s:polyline", NS).attrib["points"].split()
         self.assertLessEqual(len(points), 4 * (plot_metrics.WIDTH - plot_metrics.LEFT - plot_metrics.RIGHT))
         self.assertIn(85.0, [float(p.split(",")[1]) for p in points])
@@ -236,7 +275,7 @@ class PlotMetricsTests(unittest.TestCase):
         self.assertEqual(marker.find("s:text", NS).text, "Peak")
         tooltip = marker.find("s:title", NS).text
         self.assertIn(timestamp, tooltip)
-        self.assertIn("10.123456789 %", tooltip)
+        self.assertIn("Peak CPU: 10 %", tooltip)
         self.assertIn("elapsed_s: 30.0", tooltip)
         self.assertIn("container: demo", tooltip)
         overview_markers = self.xml("overview").findall(".//s:g[@class='peak-marker']", NS)

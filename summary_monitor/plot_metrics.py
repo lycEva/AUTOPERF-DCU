@@ -79,6 +79,60 @@ def _fmt(value):
     return format(value, ".6g")
 
 
+def _axis_value(value, digits=2):
+    """Y tick text rounded to `digits` significant digits, kept out of exponents.
+
+    ``.2g`` would print 150 as 1.5e+02 and 20480 as 2e+04, which is wrong for a
+    value axis read at a glance. Very large/small magnitudes fall back to ``_fmt``
+    so no label ever grows into a hundreds-of-digits fixed string.
+    """
+    if value == 0 or not math.isfinite(value):
+        return "0"
+    magnitude = math.floor(math.log10(abs(value)))
+    if magnitude > 6 or magnitude < -5:
+        return _fmt(value)
+    decimals = digits - 1 - magnitude
+    if decimals >= 0:
+        text = f"{round(value, decimals):.{decimals}f}"
+        return text.rstrip("0").rstrip(".") if "." in text else text
+    step = 10.0 ** -decimals
+    return f"{round(value / step) * step:.0f}"
+
+
+# A minute of 0.0001 is 6 ms: below this the axis origin is noise, not elapsed time.
+TIME_TICK_EPSILON = 1e-4
+
+
+def _time_tick(minutes):
+    """Tick text for the time axis; a sub-6 ms origin reads as 0, never 2.68e-06."""
+    if abs(minutes) < TIME_TICK_EPSILON:
+        return "0"
+    return _fmt(minutes)
+
+
+def _time_ticks(low_minutes, high_minutes, target=6):
+    """Round tick values in minutes covering [low_minutes, high_minutes].
+
+    Ticks are multiples of 1/2/5 x 10^n so the axis reads 0, 10, 20, ... instead
+    of raw interpolated values like 8.62375. Returns [] for a degenerate or
+    non-finite range; the caller then falls back to evenly spaced labels.
+    """
+    span = high_minutes - low_minutes
+    if not math.isfinite(span) or span <= 0.0:
+        return []
+    step = 10.0 ** math.floor(math.log10(span / target))
+    for factor in (1.0, 2.0, 5.0, 10.0):
+        if factor * step >= span / target:
+            step *= factor
+            break
+    ticks = []
+    index = math.ceil(low_minutes / step)
+    while index * step <= high_minutes + step * 1e-9:
+        ticks.append(round(index * step, 12))
+        index += 1
+    return ticks
+
+
 def _reduce(points, xmin, xmax, pixels):
     """Reduce (elapsed, value, segment, row_index) without crossing gaps.
 
@@ -109,6 +163,11 @@ def _panel(rows, metric, containers, yoffset=0):
     plot_height = HEIGHT - TOP - BOTTOM
     elapsed = [row["elapsed_s"] for row in rows if row["elapsed_s"] is not None]
     xmin, xmax = (min(elapsed), max(elapsed)) if elapsed else (0.0, 1.0)
+    # The first sample is written a fraction of a millisecond after the run
+    # started, so xmin is a tiny positive number rather than 0. Moving it less
+    # than a pixel (span/1000) keeps the origin tick at zero instead of 2.68e-06.
+    if 0.0 < xmin < (xmax - xmin) / 1000.0:
+        xmin = 0.0
     values = [row[column] for row in rows if row[column] is not None]
     ymin = min(0.0, min(values)) if values else 0.0
     ymax = max(0.0, max(values)) if values else 1.0
@@ -120,8 +179,11 @@ def _panel(rows, metric, containers, yoffset=0):
     xscale = max(abs(xmin), abs(xmax), 1.0)
     xlow, xhigh = xmin / xscale, xmax / xscale
 
+    def x_of(x):
+        return LEFT + ((x / xscale - xlow) / (xhigh - xlow) if xhigh != xlow else .5) * plot_width
+
     def xy(x, y):
-        px = LEFT + ((x / xscale - xlow) / (xhigh - xlow) if xhigh != xlow else .5) * plot_width
+        px = x_of(x)
         py = TOP + (high - y / yscale) / (high - low) * plot_height
         return f"{px:.2f},{py:.2f}"
 
@@ -145,7 +207,8 @@ def _panel(rows, metric, containers, yoffset=0):
                      f'{_escape(", ".join(containers) or "(none)")}</text>')
     if values:
         peak = max((row for row in rows if row[column] is not None), key=lambda row: row[column])
-        peak_text = f'Peak: {_fmt(peak[column])} {unit} at {peak["timestamp"] or "unknown time"} | container: {peak["container"]}'
+        peak_text = (f'Peak: {_axis_value(peak[column])} {unit} at '
+                     f'{peak["timestamp"] or "unknown time"} | container: {peak["container"]}')
     else:
         peak_text = "No valid samples (No valid data)"
     parts.append(f'<text x="{LEFT}" y="65" font-size="12">{_escape(peak_text)}</text>')
@@ -154,14 +217,20 @@ def _panel(rows, metric, containers, yoffset=0):
         fraction = i / 4
         y = TOP + plot_height * (1 - fraction)
         value = (low * (1 - fraction) + high * fraction) * yscale
-        tick_label = _fmt(value) + ('%' if unit == '%' else '')
+        tick_label = _axis_value(value) + ('%' if unit == '%' else '')
         parts.extend((f'<path d="M{LEFT},{y:.2f} H{WIDTH - RIGHT}" stroke="#e2e8f0"/>',
                       f'<text x="{LEFT - 9}" y="{y + 4:.2f}" text-anchor="end" font-size="11">{_escape(tick_label)}</text>'))
-        x = LEFT + plot_width * fraction
-        tick = (xlow * (1 - fraction) + xhigh * fraction) * xscale
-        parts.append(f'<text x="{x:.2f}" y="{TOP + plot_height + 20}" text-anchor="middle" font-size="11">{_escape(_fmt(tick))}</text>')
+    # Sampled elapsed time is stored in seconds; the horizontal axis shows
+    # rounded minutes (0, 10, 20, ...) instead of interpolated raw values.
+    x_ticks = _time_ticks(xmin / 60.0, xmax / 60.0)
+    if not x_ticks:
+        # Degenerate or overflowing range: keep five evenly spaced labels.
+        x_ticks = [((xlow * (1 - i / 4) + xhigh * i / 4) * xscale) / 60.0 for i in range(5)]
+    for tick_minutes in x_ticks:
+        parts.append(f'<text x="{x_of(tick_minutes * 60.0):.2f}" y="{TOP + plot_height + 20}" '
+                     f'text-anchor="middle" font-size="11">{_escape(_time_tick(tick_minutes))}</text>')
     parts.extend((f'<path d="M{LEFT},{TOP} V{TOP + plot_height} H{WIDTH - RIGHT}" fill="none" stroke="#64748b"/>',
-                  f'<text x="{LEFT + plot_width / 2}" y="{HEIGHT - 9}" text-anchor="middle" font-size="12">Elapsed time (s)</text>'))
+                  f'<text x="{LEFT + plot_width / 2}" y="{HEIGHT - 9}" text-anchor="middle" font-size="12">Elapsed time (min)</text>'))
     for index_c, container in enumerate(containers):
         line_color = color if not multi else palette[index_c % len(palette)]
         points = []
@@ -196,7 +265,7 @@ def _panel(rows, metric, containers, yoffset=0):
         label_x = float(x) - 9 if float(x) > WIDTH - RIGHT - 65 else float(x) + 9
         anchor = "end" if float(x) > WIDTH - RIGHT - 65 else "start"
         label_y = float(y) + 18 if float(y) < TOP + plot_height - 25 else float(y) - 12
-        tooltip = (f'Peak {label}: {peak[column]} {unit} | timestamp: {peak["timestamp"] or "unknown time"}'
+        tooltip = (f'Peak {label}: {_axis_value(peak[column])} {unit} | timestamp: {peak["timestamp"] or "unknown time"}'
                    f' | elapsed_s: {peak["elapsed_s"]} | container: {peak["container"]}')
         parts.extend((f'<g class="peak-marker" aria-label="Peak {_escape(label)}">',
                       f'<title>{_escape(tooltip)}</title>',
